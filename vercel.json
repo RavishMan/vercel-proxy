@@ -1,5 +1,11 @@
 {
-    "routes": [
-      { "src": "/(.*)", "dest": "/api" }
-    ]
-  }
+  "regions": ["fra1"],
+  "functions": {
+    "api/index.go": {
+      "maxDuration": 15
+    }
+  },
+  "routes": [
+    { "src": "/(.*)", "dest": "/api" }
+  ]
+}

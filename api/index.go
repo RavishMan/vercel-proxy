@@ -1,65 +1,108 @@
 package api
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
+	"time"
 )
 
-func internalServerError(w http.ResponseWriter, err error) {
-	if err != nil {
-		log.Printf("Internal server error: %v", err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+// Only https requests to ALLOWED_HOSTS (comma-separated) under
+// ALLOWED_PATH_PREFIX are proxied. Without ALLOWED_HOSTS every request is
+// rejected.
+const defaultPathPrefix = "/sub/"
+
+var (
+	schemeRe = regexp.MustCompile(`^/*(https?:)/*`)
+
+	client = &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("too many redirects")
+			}
+			if !allowedTarget(req.URL) {
+				return errors.New("redirect to a disallowed target")
+			}
+			return nil
+		},
 	}
+)
+
+func allowedHosts() map[string]bool {
+	hosts := map[string]bool{}
+	for _, h := range strings.Split(os.Getenv("ALLOWED_HOSTS"), ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			hosts[h] = true
+		}
+	}
+	return hosts
+}
+
+func pathPrefix() string {
+	if p := os.Getenv("ALLOWED_PATH_PREFIX"); p != "" {
+		return p
+	}
+	return defaultPathPrefix
+}
+
+func allowedTarget(u *url.URL) bool {
+	if u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	if p := u.Port(); p != "" && p != "443" {
+		return false
+	}
+	if !allowedHosts()[strings.ToLower(u.Hostname())] {
+		return false
+	}
+	// Reject dot segments and duplicate slashes instead of rewriting them.
+	clean := path.Clean(u.Path)
+	if u.Path != clean && u.Path != clean+"/" {
+		return false
+	}
+	prefix := pathPrefix()
+	return strings.HasPrefix(clean+"/", prefix) && clean+"/" != prefix
 }
 
 func Handler(w http.ResponseWriter, r *http.Request) {
-
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("WithHandler panic: %v", err)
-			http.Error(w, fmt.Sprintf("internal server error: %v", err), http.StatusInternalServerError)
+			log.Printf("panic: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	}()
 
-	htmlProxy := os.Getenv("HTTP_PROXY_ENABLE") == "true"
-
-	// Set the CORS headers
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-PROXY-HOST, X-PROXY-SCHEME")
-
-	// Handle the OPTIONS preflight request
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Redirect to the GitHub repository
-	if r.URL.Path == "/" {
-		http.Redirect(w, r, "https://github.com/TBXark/vercel-proxy", http.StatusMovedPermanently)
+	raw := schemeRe.ReplaceAllString(r.URL.Path, "$1//")
+	if !strings.HasPrefix(raw, "http") {
+		http.NotFound(w, r)
 		return
 	}
-
-	// Get the URL to proxy
-	re := regexp.MustCompile(`^/*(https?:)/*`)
-	u := re.ReplaceAllString(r.URL.Path, "$1//")
-	if r.URL.RawQuery != "" {
-		u += "?" + r.URL.RawQuery
-	}
-	if !strings.HasPrefix(u, "http") {
-		http.Error(w, "invalid url: "+u, http.StatusBadRequest)
-		return
-	}
-
-	// Create a new request
-	req, err := http.NewRequest(r.Method, u, r.Body)
+	target, err := url.Parse(raw)
 	if err != nil {
-		internalServerError(w, err)
+		http.NotFound(w, r)
+		return
+	}
+	target.RawQuery = r.URL.RawQuery
+	if !allowedTarget(target) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), nil)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	for k, v := range r.Header {
@@ -67,45 +110,22 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			req.Header.Add(k, vv)
 		}
 	}
-	if htmlProxy && r.Header.Get("Accept-Encoding") != "" {
-		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			req.Header.Set("Accept-Encoding", "gzip")
-		}
-	}
 
-	// Send the request to the real server
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		internalServerError(w, err)
+		log.Printf("upstream error: %v", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
-	defer func(writer http.ResponseWriter, response *http.Response) {
-		internalServerError(writer, response.Body.Close())
-	}(w, resp)
+	defer resp.Body.Close()
 
-	if e := proxyRaw(w, resp, r); e != nil {
-		internalServerError(w, e)
-		return
-	}
-
-	w.WriteHeader(resp.StatusCode)
-}
-
-func proxyRaw(w http.ResponseWriter, resp *http.Response, req *http.Request) error {
 	for k, v := range resp.Header {
 		for _, vv := range v {
 			w.Header().Add(k, vv)
 		}
 	}
-	if w.Header().Get("Referer") != "" {
-		w.Header().Del("Referer")
-		w.Header().Add("Referer", req.Host)
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("copy error: %v", err)
 	}
-
-	// Copy the response body to the output stream
-	_, err := io.Copy(w, resp.Body)
-	if err != nil {
-		return err
-	}
-	return nil
 }
